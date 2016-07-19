@@ -14,12 +14,12 @@
     You should have received a copy of the GNU General Public License
     along with this telegram-cli.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright Vitaly Valtman 2013-2014
+    Copyright Vitaly Valtman 2013-2015
 */
 #ifndef __INTERFACE_H__
 #define __INTERFACE_H__
-#include "structures.h"
-#include "tgl-layout.h"
+#include <tgl/tgl-structures.h>
+#include <tgl/tgl-layout.h>
 
 #define COLOR_RED "\033[0;31m"
 #define COLOR_REDB "\033[1;31m"
@@ -45,7 +45,7 @@ void logprintf (const char *format, ...) __attribute__ ((format (printf, 1, 2)))
 
 #define vlogprintf(v,...) \
   do { \
-    if (tgl_state.verbosity >= (v)) {\
+    if (TLS->verbosity >= (v)) {\
       logprintf (__VA_ARGS__);\
     }\
   } while (0);\
@@ -68,6 +68,7 @@ struct tgl_message;
 struct in_ev;
 void print_message (struct in_ev *ev, struct tgl_message *M);
 void print_chat_name (struct in_ev *ev, tgl_peer_id_t id, tgl_peer_t *C);
+void print_channel_name (struct in_ev *ev, tgl_peer_id_t id, tgl_peer_t *C);
 void print_user_name (struct in_ev *ev, tgl_peer_id_t id, tgl_peer_t *U);
 void print_encr_chat_name_full (struct in_ev *ev, tgl_peer_id_t id, tgl_peer_t *C);
 void print_encr_chat_name (struct in_ev *ev, tgl_peer_id_t id, tgl_peer_t *C);
@@ -83,4 +84,9 @@ void print_date (struct in_ev *ev, long t);
 void play_sound (void);
 void update_prompt (void);
 void set_interface_callbacks (void);
+
+char *print_permanent_msg_id (tgl_message_id_t id);
+char *print_permanent_peer_id (tgl_peer_id_t id);
+tgl_peer_id_t parse_input_peer_id (const char *s, int l, int mask);
+tgl_message_id_t parse_input_msg_id (const char *s, int l);
 #endif

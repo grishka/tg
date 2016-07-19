@@ -14,11 +14,15 @@
     You should have received a copy of the GNU General Public License
     along with this telegram-cli.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright Vitaly Valtman 2013-2014
+    Copyright Vitaly Valtman 2013-2015
 */
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
+#endif
+
+#ifdef USE_PYTHON
+#  include "python-tg.h"
 #endif
 
 #include <stdio.h>
@@ -29,19 +33,11 @@
 #include <termios.h>
 #include <unistd.h>
 #include <assert.h>
-#if (READLINE == GNU)
+#ifdef __FreeBSD__
+#include <sys/socket.h>
+#include <netinet/in.h>
+#endif
 #include <readline/readline.h>
-#else
-#include <editline/readline.h>
-#endif
-#ifdef EVENT_V2
-#include <event2/event.h>
-#include <event2/bufferevent.h>
-#include <event2/buffer.h>
-#else
-#include <event.h>
-#include "event-old.h"
-#endif
 
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -64,13 +60,16 @@
 #include "telegram.h"
 #include "loop.h"
 #include "interface.h"
-#include "tools.h"
+#include <tgl/tools.h>
+#include <getopt.h>
+#include <tgl/mtproto-key.h>
 
 #ifdef USE_LUA
 #  include "lua-tg.h"
 #endif
 
-#include "tgl.h"
+
+#include <tgl/tgl.h>
 
 #define PROGNAME "telegram-cli"
 #define VERSION "0.07"
@@ -90,6 +89,7 @@
   "# This is an empty config file\n" \
   "# Feel free to put something here\n"
 
+int bot_mode;
 int verbosity;
 int msg_num_mode;
 char *default_username;
@@ -102,6 +102,7 @@ char *downloads_directory;
 char *config_directory;
 char *binlog_file_name;
 char *lua_file;
+char *python_file;
 int binlog_enabled;
 extern int log_level;
 int sync_from_start;
@@ -112,7 +113,17 @@ int disable_output;
 int reset_authorization;
 int port;
 int use_ids;
+int ipv6_enabled;
 char *start_command;
+int disable_link_preview;
+int enable_json;
+int alert_sound;
+int exit_code;
+int permanent_msg_id_mode;
+int permanent_peer_id_mode;
+char *home_directory;
+
+struct tgl_state *TLS;
 
 void set_default_username (const char *s) {
   if (default_username) { 
@@ -157,11 +168,11 @@ int str_empty (char *str) {
 }
 
 char *get_home_directory (void) {
-  static char *home_directory = NULL;
+  if (home_directory) { return home_directory; }
   home_directory = getenv("TELEGRAM_HOME");
-  if (!str_empty (home_directory)) { return tstrdup (home_directory); }
+  if (!str_empty (home_directory)) { return home_directory = tstrdup (home_directory); }
   home_directory = getenv("HOME");
-  if (!str_empty (home_directory)) { return tstrdup (home_directory); }
+  if (!str_empty (home_directory)) { return home_directory = tstrdup (home_directory); }
   struct passwd *current_passwd;
   uid_t user_id;
   setpwent ();
@@ -254,7 +265,7 @@ void running_for_first_time (void) {
   // printf ("I: config file=[%s]\n", config_filename);
 
   int config_file_fd;
-  char *config_directory = get_config_directory ();
+  //char *config_directory = get_config_directory ();
   //char *downloads_directory = get_downloads_directory ();
 
   if (!mkdir (config_directory, CONFIG_DIRECTORY_MODE)) {
@@ -279,18 +290,6 @@ void running_for_first_time (void) {
       exit (EXIT_FAILURE);
     }
     close (config_file_fd);
-    /*int auth_file_fd = open (get_auth_key_filename (), O_CREAT | O_RDWR, 0600);
-    int x = -1;
-    assert (write (auth_file_fd, &x, 4) == 4);
-    close (auth_file_fd);
-
-    printf ("[%s] created\n", config_filename);*/
-  
-    /* create downloads directory */
-    /*if (mkdir (downloads_directory, 0755) !=0) {
-      perror ("creating download directory");
-      exit (EXIT_FAILURE);
-    }*/
   }
 }
 
@@ -348,7 +347,7 @@ void parse_config (void) {
   strcpy (buf + l, "test");
   config_lookup_bool (&conf, buf, &test_mode);
   if (test_mode) {
-    tgl_set_test_mode ();
+    tgl_set_test_mode (TLS);
   }
   
   strcpy (buf + l, "log_level");
@@ -371,27 +370,35 @@ void parse_config (void) {
     parse_config_val (&conf, &lua_file, "lua_script", 0, config_directory);
   }
   
+  if (!python_file) {
+    parse_config_val (&conf, &python_file, "python_script", 0, config_directory);
+  }
+ 
+  #if 0
   strcpy (buf + l, "binlog_enabled");
   config_lookup_bool (&conf, buf, &binlog_enabled);
+  #else
+  binlog_enabled = 0;
+  #endif
   
   int pfs_enabled = 0;
   strcpy (buf + l, "pfs_enabled");
   config_lookup_bool (&conf, buf, &pfs_enabled);
   if (pfs_enabled) {
-    tgl_enable_pfs ();
+    tgl_enable_pfs (TLS);
   }
 
   if (binlog_enabled) {
     parse_config_val (&conf, &binlog_file_name, "binlog", BINLOG_FILE, config_directory);
-    tgl_set_binlog_mode (1);
-    tgl_set_binlog_path (binlog_file_name);
+    tgl_set_binlog_mode (TLS, 1);
+    tgl_set_binlog_path (TLS, binlog_file_name);
   } else {
-    tgl_set_binlog_mode (0);
+    tgl_set_binlog_mode (TLS, 0);
     parse_config_val (&conf, &state_file_name, "state_file", STATE_FILE, config_directory);
     parse_config_val (&conf, &secret_chat_file_name, "secret", SECRET_CHAT_FILE, config_directory);
     //tgl_set_auth_file_path (auth_file_name);
   }
-  tgl_set_download_directory (downloads_directory);
+  tgl_set_download_directory (TLS, downloads_directory);
   
   if (!mkdir (config_directory, CONFIG_DIRECTORY_MODE)) {
     if (!disable_output) {
@@ -403,6 +410,8 @@ void parse_config (void) {
       printf ("[%s] created\n", downloads_directory);
     }
   }
+  tfree_str (config_directory);
+  config_directory = NULL;
   config_destroy (&conf);
 }
 #else
@@ -411,19 +420,19 @@ void parse_config (void) {
     printf ("libconfig not enabled\n");
   }
   tasprintf (&downloads_directory, "%s/%s/%s", get_home_directory (), CONFIG_DIRECTORY, DOWNLOADS_DIRECTORY);
-  
+
   if (binlog_enabled) {
     tasprintf (&binlog_file_name, "%s/%s/%s", get_home_directory (), CONFIG_DIRECTORY, BINLOG_FILE);
-    tgl_set_binlog_mode (1);
-    tgl_set_binlog_path (binlog_file_name);
+    tgl_set_binlog_mode (TLS, 1);
+    tgl_set_binlog_path (TLS, binlog_file_name);
   } else {
-    tgl_set_binlog_mode (0);
+    tgl_set_binlog_mode (TLS, 0);
     //tgl_set_auth_file_path (auth_file_name;
     tasprintf (&auth_file_name, "%s/%s/%s", get_home_directory (), CONFIG_DIRECTORY, AUTH_KEY_FILE);
     tasprintf (&state_file_name, "%s/%s/%s", get_home_directory (), CONFIG_DIRECTORY, STATE_FILE);
     tasprintf (&secret_chat_file_name, "%s/%s/%s", get_home_directory (), CONFIG_DIRECTORY, SECRET_CHAT_FILE);
   }
-  tgl_set_download_directory (downloads_directory);
+  tgl_set_download_directory (TLS, downloads_directory);
   if (!mkdir (downloads_directory, CONFIG_DIRECTORY_MODE)) {
     if (!disable_output) {
       printf ("[%s] created\n", downloads_directory);
@@ -439,34 +448,50 @@ void inner_main (void) {
 void usage (void) {
   printf ("%s Usage\n", PROGNAME);
     
-  printf ("  -u                  specify username (would not be asked during authorization)\n");
-  printf ("  -k                  specify location of public key (possible multiple entries)\n");
-  printf ("  -v                  increase verbosity (0-ERROR 1-WARNIN 2-NOTICE 3+-DEBUG-levels)\n");
-  printf ("  -N                  message num mode\n");
+  printf ("  --phone/-u                           specify username (would not be asked during authorization)\n");
+  printf ("  --rsa-key/-k                         specify location of public key (possible multiple entries)\n");
+  printf ("  --verbosity/-v                       increase verbosity (0-ERROR 1-WARNIN 2-NOTICE 3+-DEBUG-levels)\n");
+  printf ("  --enable-msg-id/-N                   message num mode\n");
   #ifdef HAVE_LIBCONFIG
-  printf ("  -c                  config file name\n");
-  printf ("  -p                  use specified profile\n");
+  printf ("  --config/-c                          config file name\n");
+  printf ("  --profile/-p                         use specified profile\n");
   #else
-  printf ("  -B                  enable binlog\n");
+  #if 0
+  printf ("  --enable-binlog/-B                   enable binlog\n");
   #endif
-  printf ("  -l                  log level\n");
-  printf ("  -f                  during authorization fetch all messages since registration\n");
-  printf ("  -E                  disable auto accept of encrypted chats\n");
+  #endif
+  printf ("  --log-level/-l                       log level\n");
+  printf ("  --sync-from-start/-f                 during authorization fetch all messages since registration\n");
+  printf ("  --disable-auto-accept/-E             disable auto accept of encrypted chats\n");
   #ifdef USE_LUA
-  printf ("  -s                  lua script file\n");
+  printf ("  --lua-script/-s                      lua script file\n");
   #endif
-  printf ("  -W                  send dialog_list query and wait for answer before reading input\n");
-  printf ("  -C                  disable color output\n");
-  printf ("  -R                  disable readline\n");
-  printf ("  -d                  daemon mode\n");
-  printf ("  -L <log-name>       log file name\n");
-  printf ("  -U <user-name>      change uid after start\n");
-  printf ("  -G <group-name>     change gid after start\n");
-  printf ("  -D                  disable output\n");
-  printf ("  -P <port>           port to listen for input commands\n");
-  printf ("  -S <socket-name>    unix socket to create\n");
-  printf ("  -e <commands>       make commands end exit\n");
-  printf ("  -I                  use user and chat IDs in updates instead of names\n");
+  printf ("  --wait-dialog-list/-W                send dialog_list query and wait for answer before reading input\n");
+  printf ("  --disable-colors/-C                  disable color output\n");
+  printf ("  --disable-readline/-R                disable readline\n");
+  printf ("  --alert/-A                           enable bell notifications\n");
+  printf ("  --daemonize/-d                       daemon mode\n");
+  printf ("  --logname/-L <log-name>              log file name\n");
+  printf ("  --username/-U <user-name>            change uid after start\n");
+  printf ("  --groupname/-G <group-name>          change gid after start\n");
+  printf ("  --disable-output/-D                  disable output\n");
+  printf ("  --tcp-port/-P <port>                 port to listen for input commands\n");
+  printf ("  --udp-socket/-S <socket-name>        unix socket to create\n");
+  printf ("  --exec/-e <commands>                 make commands end exit\n");
+  printf ("  --disable-names/-I                   use user and chat IDs in updates instead of names\n");
+  printf ("  --enable-ipv6/-6                     use ipv6 (may be unstable)\n");
+  printf ("  --help/-h                            prints this help\n");
+  printf ("  --accept-any-tcp                     accepts tcp connections from any src (only loopback by default)\n");
+  printf ("  --disable-link-preview               disables server-side previews to links\n");
+  printf ("  --bot/-b                             bot mode\n");  
+  #ifdef USE_JSON
+  printf ("  --json                               prints answers and values in json format\n");
+  #endif
+  #ifdef USE_PYTHON
+  printf ("  --python-script/-Z <script-name>     python script file\n");
+  #endif
+  printf ("  --permanent-msg-ids                  use permanent msg ids\n");
+  printf ("  --permanent-peer-ids                 use permanent peer ids\n");
 
   exit (1);
 }
@@ -485,7 +510,7 @@ int disable_auto_accept;
 int wait_dialog_list;
 
 char *logname;
-int daemonize;
+int daemonize=0;
 
 
 void reopen_logs (void) {
@@ -523,6 +548,8 @@ static void sighup_handler (const int sig) {
 
 char *set_user_name;
 char *set_group_name;
+int accept_any_tcp;
+char *bot_hash;
 
 int change_user_group () {
   char *username = set_user_name;
@@ -560,6 +587,11 @@ int change_user_group () {
     if (setuid (pw->pw_uid) < 0) {
       fprintf (stderr, "change_user_group: failed to assume identity of user %s\n", username);
       return -1;
+    } else {
+      pw = getpwuid(getuid());
+      setenv("USER", pw->pw_name, 1);
+      setenv("HOME", pw->pw_dir, 1);
+      setenv("SHELL", pw->pw_shell, 1);
     }
   }
   return 0;
@@ -568,28 +600,97 @@ int change_user_group () {
 char *unix_socket;
 
 void args_parse (int argc, char **argv) {
+  TLS = tgl_state_alloc ();
+
+  static struct option long_options[] = {
+    {"debug-allocator", no_argument, 0,  1000 },
+    {"phone", required_argument, 0, 'u'}, 
+    {"rsa-key", required_argument, 0, 'k'},
+    {"verbosity", no_argument, 0, 'v'},
+    {"enable-msg-id", no_argument, 0, 'N'},
+#ifdef HAVE_LIBCONFIG
+    {"config", required_argument, 0, 'c'},
+    {"profile", required_argument, 0, 'p'},
+#else
+    #if 0
+    {"enable-binlog", no_argument, 0, 'B'},
+    #endif
+#endif
+    {"log-level", required_argument, 0, 'l'},
+    {"sync-from-start", no_argument, 0, 'f'},
+    {"disable-auto-accept", no_argument, 0, 'E'},
+    {"allow-weak-random", no_argument, 0, 'w'},
+#ifdef USE_LUA
+    {"lua-script", required_argument, 0, 's'},
+#endif
+    {"wait-dialog-list", no_argument, 0, 'W'},
+    {"disable-colors", no_argument, 0, 'C'},
+    {"disable-readline", no_argument, 0, 'R'},
+    {"alert", no_argument, 0, 'A'},
+    {"daemonize", no_argument, 0, 'd'},
+    {"logname", required_argument, 0, 'L'},
+    {"username", required_argument, 0, 'U'},
+    {"groupname", required_argument, 0, 'G'},
+    {"disable-output", no_argument, 0, 'D'},
+    {"reset-authorization", no_argument, 0, 'q'},
+    {"tcp-port", required_argument, 0, 'P'},
+    {"unix-socket", required_argument, 0, 'S'},
+    {"exec", required_argument, 0, 'e'},
+    {"disable-names", no_argument, 0, 'I'},
+    {"enable-ipv6", no_argument, 0, '6'},
+    {"bot", optional_argument, 0, 'b'},
+    {"help", no_argument, 0, 'h'},
+    {"accept-any-tcp", no_argument, 0,  1001},
+    {"disable-link-preview", no_argument, 0, 1002},
+    {"json", no_argument, 0, 1003},
+    {"python-script", required_argument, 0, 'Z'},
+    {"permanent-msg-ids", no_argument, 0, 1004},
+    {"permanent-peer-ids", no_argument, 0, 1005},
+    {0,         0,                 0,  0 }
+  };
+
+
+
   int opt = 0;
-  while ((opt = getopt (argc, argv, "u:hk:vNl:fEwWCRdL:DU:G:qP:S:e:I"
+  while ((opt = getopt_long (argc, argv, "u:hk:vNl:fEwWCRAdL:DU:G:qP:S:e:I6b"
 #ifdef HAVE_LIBCONFIG
   "c:p:"
 #else
+  #if 0
   "B"
+  #endif
 #endif
 #ifdef USE_LUA
   "s:"
 #endif
+#ifdef USE_PYTHON
+  "Z:"
+#endif
+  , long_options, NULL
   
   )) != -1) {
     switch (opt) {
+    case 'b':
+      bot_mode ++;
+      if (optarg) {
+        bot_hash = optarg;
+      }
+      break;
+    case 1000:
+      tgl_allocator = &tgl_allocator_debug;
+      break;
+    case 1001:
+      accept_any_tcp = 1;
+      break;
     case 'u':
       set_default_username (optarg);
       break;
     case 'k':
       //rsa_public_key_name = tstrdup (optarg);
-      tgl_set_rsa_key (optarg);
+      tgl_set_rsa_key (TLS, optarg);
       break;
     case 'v':
-      tgl_incr_verbosity ();
+      tgl_incr_verbosity (TLS);
       verbosity ++;
       break;
     case 'N':
@@ -600,13 +701,15 @@ void args_parse (int argc, char **argv) {
       config_filename = tstrdup (optarg);
       break;
     case 'p':
-      prefix = tstrdup (optarg);
+      prefix = optarg;
       assert (strlen (prefix) <= 100);
       break;
 #else
+    #if 0
     case 'B':
       binlog_enabled = 1;
       break;
+    #endif
 #endif
     case 'l':
       log_level = atoi (optarg);
@@ -628,11 +731,19 @@ void args_parse (int argc, char **argv) {
     case 'W':
       wait_dialog_list = 1;
       break;
+#ifdef USE_PYTHON
+    case 'Z':
+      python_file = strdup (optarg);
+      break;
+#endif
     case 'C':
       disable_colors ++;
       break;
     case 'R':
       readline_disabled ++;
+      break;
+    case 'A':
+      alert_sound = 1;
       break;
     case 'd':
       daemonize ++;
@@ -663,6 +774,21 @@ void args_parse (int argc, char **argv) {
       break;
     case 'I':
       use_ids ++;
+      break;
+    case '6':
+      ipv6_enabled = 1;
+      break;
+    case 1002:
+      disable_link_preview = 2;
+      break;
+    case 1003:
+      enable_json = 1;
+      break;
+    case 1004:
+      permanent_msg_id_mode = 1;
+      break;
+    case 1005:
+      permanent_peer_id_mode = 1;
       break;
     case 'h':
     default:
@@ -722,18 +848,23 @@ void sig_term_handler (int signum __attribute__ ((unused))) {
   if (write (1, "SIGTERM/SIGINT received\n", 25) < 0) { 
     // Sad thing
   }
-  if (tgl_state.ev_base) {
-    event_base_loopbreak(tgl_state.ev_base);
-  }
+  //if (TLS && TLS->ev_base) {
+  //  event_base_loopbreak (TLS->ev_base);
+  //}
   sigterm_cnt ++;
 }
 
 void do_halt (int error) {
+  int retval;
+  if (daemonize) {
+    return;
+  }
+
   if (!readline_disabled) {
     rl_free_line_state ();
     rl_cleanup_after_signal ();
   }
-  
+
   if (write (1, "halt\n", 5) < 0) { 
     // Sad thing
   }
@@ -748,8 +879,14 @@ void do_halt (int error) {
   if (sfd > 0) {
     close (sfd);
   }
-  
-  exit (error ? EXIT_FAILURE : EXIT_SUCCESS);
+ 
+  if (exit_code) {
+    retval = exit_code;
+  } else {
+    retval = error ? EXIT_FAILURE : EXIT_SUCCESS;
+  }
+
+  exit (retval);
 }
 
 int main (int argc, char **argv) {
@@ -775,17 +912,21 @@ int main (int argc, char **argv) {
 
   if (port > 0) {
     struct sockaddr_in serv_addr;
-
+    int yes = 1;
     sfd = socket (AF_INET, SOCK_STREAM, 0);
     if (sfd < 0) {
       perror ("socket");
       exit(1);
     }
 
+    if(setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) < 0) {
+      perror("setsockopt");
+      exit(1);
+    }
     memset (&serv_addr, 0, sizeof (serv_addr));
     
     serv_addr.sin_family = AF_INET;
-    serv_addr.sin_addr.s_addr = htonl (0x7f000001);
+    serv_addr.sin_addr.s_addr = accept_any_tcp ? INADDR_ANY : htonl (0x7f000001);
     serv_addr.sin_port = htons (port);
  
     if (bind (sfd, (struct sockaddr *) &serv_addr, sizeof (serv_addr)) < 0) {
@@ -812,7 +953,7 @@ int main (int argc, char **argv) {
     
     serv_addr.sun_family = AF_UNIX;
 
-    snprintf (serv_addr.sun_path, 108, "%s", unix_socket);
+    snprintf (serv_addr.sun_path, sizeof(serv_addr.sun_path), "%s", unix_socket);
  
     if (bind (usfd, (struct sockaddr *) &serv_addr, sizeof (serv_addr)) < 0) {
       perror ("bind");
@@ -832,18 +973,31 @@ int main (int argc, char **argv) {
 
   if (!disable_output) {
     printf (
-      "Telegram-cli version " TGL_VERSION ", Copyright (C) 2013-2014 Vitaly Valtman\n"
+      "Telegram-cli version " TELEGRAM_CLI_VERSION ", Copyright (C) 2013-2015 Vitaly Valtman\n"
       "Telegram-cli comes with ABSOLUTELY NO WARRANTY; for details type `show_license'.\n"
       "This is free software, and you are welcome to redistribute it\n"
       "under certain conditions; type `show_license' for details.\n"
+      "Telegram-cli uses libtgl version " TGL_VERSION "\n"
+#ifndef TGL_AVOID_OPENSSL 
+      "Telegram-cli includes software developed by the OpenSSL Project\n"
+      "for use in the OpenSSL Toolkit. (http://www.openssl.org/)\n"
+#endif
+#ifdef USE_PYTHON
+      "Telegram-cli uses libpython version " PY_VERSION "\n"
+#endif
     );
   }
   running_for_first_time ();
   parse_config ();
 
-  tgl_set_rsa_key ("/etc/" PROG_NAME "/server.pub");
-  tgl_set_rsa_key ("tg-server.pub");
+  #ifdef __FreeBSD__
+  tgl_set_rsa_key (TLS, "/usr/local/etc/" PROG_NAME "/server.pub");
+  #else
+  tgl_set_rsa_key (TLS, "/etc/" PROG_NAME "/server.pub");
+  #endif
+  tgl_set_rsa_key (TLS, "tg-server.pub");
 
+  tgl_set_rsa_key_direct (TLS, tglmp_get_default_e (), tglmp_get_default_key_len (), tglmp_get_default_key ());
 
   get_terminal_attributes ();
 
@@ -852,6 +1006,12 @@ int main (int argc, char **argv) {
     lua_init (lua_file);
   }
   #endif
+  #ifdef USE_PYTHON
+  if (python_file) {
+    py_init (python_file);
+  }
+  #endif
+
 
   inner_main ();
   

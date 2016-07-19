@@ -31,6 +31,9 @@ Function_list (arguments are listed aside from cb_function and cb_extra, :
   rename_chat (chat, new_name)
   chat_set_photo (chat, file)
   
+  send_typing (peer)
+  send_typing_abort (peer)
+  
   send_msg (peer, text)
   fwd_msg (peer, msg)
   
@@ -48,6 +51,7 @@ Function_list (arguments are listed aside from cb_function and cb_extra, :
   load_document_thumb(msg)
 
   chat_info (chat)
+  channel_info (channel)
   user_info (user)
 
   get_history (peer, limit)
@@ -55,8 +59,8 @@ Function_list (arguments are listed aside from cb_function and cb_extra, :
   chat_add_user (chat, user)
   chat_del_user (chat, user)
   
-  add_contactt (phone, first_name, last_name)
-  rename_contactt (phone, first_name, last_name) 
+  add_contact (phone, first_name, last_name)
+  rename_contact (phone, first_name, last_name) 
   
   msg_search (peer, text)
   msg_global_search (text)
@@ -78,3 +82,4 @@ Function_list (arguments are listed aside from cb_function and cb_extra, :
 
 Also, you have function 
   postpone (cb_function, cb_extra, timeout). It will call your cb_function in specified number of seconds (number of seconds may be double).
+  register_interface_function (name, cb_function, cb_arg, description, arg1_type, arg2_type, ...) adds function to CLI interface

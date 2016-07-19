@@ -14,18 +14,17 @@
     You should have received a copy of the GNU General Public License
     along with this telegram-cli.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright Vitaly Valtman 2013-2014
+    Copyright Vitaly Valtman 2013-2015
 */
 #ifndef __LUA_TG_H__
 #define __LUA_TG_H__
 
 #include <string.h>
-#include "lua-tg.h"
-#include "tgl.h"
+#include <tgl/tgl.h>
 
 void lua_init (const char *file);
 void lua_new_msg (struct tgl_message *M);
-void lua_our_id (int id);
+void lua_our_id (tgl_peer_id_t id);
 void lua_secret_chat_update (struct tgl_secret_chat *U, unsigned flags);
 void lua_user_update (struct tgl_user *U, unsigned flags);
 void lua_chat_update (struct tgl_chat *C, unsigned flags);

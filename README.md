@@ -22,37 +22,44 @@ Fourth, in peer_name '#' are substitued to '@'. (Not applied to appending of '#%
 
 Clone GitHub Repository
 
-     git clone https://github.com/vysheng/tg.git && cd tg
+     git clone --recursive https://github.com/vysheng/tg.git && cd tg
 
-or download and extract zip
+### Python Support
 
-     wget https://github.com/vysheng/tg/archive/master.zip -O tg-master.zip
-     unzip tg-master.zip && cd tg-master
+Python support is currently limited to Python 2.7 or Python 3.1+. Other versions may work but are not tested.
 
 #### Linux and BSDs
 
-Install libs: readline or libedit, openssl and (if you want to use config) libconfig and liblua.
-If you do not want to use them pass options --disable-libconfig and --disable-liblua respectively.
+Install libs: readline, openssl and (if you want to use config) libconfig, liblua, python and libjansson.
+If you do not want to use them pass options --disable-libconfig, --disable-liblua, --disable-python and --disable-json respectively.
 
 On Ubuntu/Debian use: 
 
-     sudo apt-get install libreadline-dev libconfig-dev libssl-dev lua5.2 liblua5.2-dev libevent-dev
+     sudo apt-get install libreadline-dev libconfig-dev libssl-dev lua5.2 liblua5.2-dev libevent-dev libjansson-dev libpython-dev make 
 
 On gentoo:
 
-     sudo emerge -av sys-libs/readline dev-libs/libconfig dev-libs/openssl dev-lang/lua dev-libs/libevent
+     sudo emerge -av sys-libs/readline dev-libs/libconfig dev-libs/openssl dev-lang/lua dev-libs/libevent dev-libs/jansson dev-lang/python
 
 On Fedora:
 
-     sudo yum install lua-devel openssl-devel libconfig-devel readline-devel
+     sudo dnf install lua-devel openssl-devel libconfig-devel readline-devel libevent-devel libjansson-devel python-devel
+
+On Archlinux:
+
+     yaourt -S telegram-cli-git
 
 On FreeBSD:
 
-     pkg install libconfig libexecinfo lua52
+     pkg install libconfig libexecinfo lua52 python
 
 On OpenBSD:
 
-     pkg_add libconfig libexecinfo lua
+     pkg_add libconfig libexecinfo lua python
+
+On openSUSE:
+
+     sudo zypper in lua-devel libconfig-devel readline-devel libevent-devel libjansson-devel python-devel libopenssl-devel
 
 Then,
 
@@ -63,7 +70,7 @@ Then,
 
 On Gentoo: use ebuild provided.
 
-On Arch: https://aur.archlinux.org/packages/telegram-git/ 
+On Arch: https://aur.archlinux.org/packages/telegram-cli-git
 
 #### Mac OS X
 
@@ -71,11 +78,9 @@ The client depends on [readline library](http://cnswww.cns.cwru.edu/php/chet/rea
 
 If using [Homebrew](http://brew.sh/):
 
-     brew install libconfig
-     brew install readline
-     brew install lua
-     export CFLAGS="-I/usr/local/include -I/usr/local/Cellar/readline/6.2.4/include"
-     export LDFLAGS="-L/usr/local/lib -L/usr/local/Cellar/readline/6.2.4/lib"
+     brew install libconfig readline lua python libevent jansson
+     export CFLAGS="-I/usr/local/include -I/usr/local/Cellar/readline/6.3.8/include"
+     export LDFLAGS="-L/usr/local/lib -L/usr/local/Cellar/readline/6.3.8/lib"
      ./configure && make
 
 Thanks to [@jfontan](https://github.com/vysheng/tg/issues/3#issuecomment-28293731) for this solution.
@@ -85,8 +90,10 @@ If using [MacPorts](https://www.macports.org):
      sudo port install libconfig-hr
      sudo port install readline
      sudo port install lua51
-     export CFLAGS="-I/usr/local/include -I/opt/local/include"
-     export LDFLAGS="-L/usr/local/lib -L/opt/local/lib/"
+     sudo port install python34
+     sudo port install libevent
+     export CFLAGS="-I/usr/local/include -I/opt/local/include -I/opt/local/include/lua-5.1"
+     export LDFLAGS="-L/usr/local/lib -L/opt/local/lib -L/opt/local/lib/lua-5.1"
      ./configure && make
 
 Install these ports:
@@ -112,7 +119,7 @@ If you would like to ask a question, you can write to my telegram or to the gith
 
     bin/telegram-cli -k <public-server-key>
     
-By default public key is stored in the same folder named tg-server.pub or in /etc/telegram-cli/server.pub, if it's not, specify where to find it:
+By default, the public key is stored in tg-server.pub in the same folder or in /etc/telegram-cli/server.pub. If not, specify where to find it:
 
     bin/telegram-cli -k tg-server.pub
 
@@ -155,7 +162,7 @@ If two or more peers have same name, <sharp>number is appended to the name. (for
 * **chat_add_user** \<chat\> \<user\> - add user to chat
 * **chat_del_user** \<chat\> \<user\> - remove user from chat
 * **rename_chat** \<chat\> \<new-name\>
-* **create_group_chat** \<user\> \<chat topic\> - creates a groupchat with user, use chat_add_user to add more users
+* **create_group_chat** \<chat topic\> \<user1\> \<user2\> \<user3\> ... - creates a groupchat with users, use chat_add_user to add more users
 * **chat_set_photo** \<chat\> \<photo-file-name\> - sets group chat photo. Same limits as for profile photos.
 
 #### Search
@@ -180,6 +187,7 @@ If two or more peers have same name, <sharp>number is appended to the name. (for
 * **stats** - just for debugging
 * **show_license** - prints contents of GPLv2
 * **help** - prints this help
+* **get_self** - get our user info
 
 #### Card
 * **export_card** - print your 'card' that anyone can later use to import your contact

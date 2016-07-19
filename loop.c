@@ -14,14 +14,20 @@
     You should have received a copy of the GNU General Public License
     along with this telegram-cli.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright Vitaly Valtman 2013-2014
+    Copyright Vitaly Valtman 2013-2015
 */
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
 
+#if USE_PYTHON
+#include "python-tg.h"
+#endif
+
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #define READLINE_CALLBACKS
 
 #include <assert.h>
@@ -56,13 +62,23 @@
 #include "interface.h"
 #include "telegram.h"
 #include "loop.h"
+#if USE_LUA
 #include "lua-tg.h"
-#include "tgl.h"
-#include "binlog.h"
+#endif
+
+#include <tgl/tgl.h>
+#include <tgl/tgl-binlog.h>
+#include <tgl/tgl-net.h>
+#include <tgl/tgl-timers.h>
+#include <tgl/tgl-queries.h>
+
+#include <openssl/sha.h>
 
 int verbosity;
 extern int readline_disabled;
+extern char *bot_hash;
 
+extern int bot_mode;
 int binlog_read;
 extern char *default_username;
 extern char *auth_token;
@@ -92,91 +108,220 @@ static int delete_stdin_event;
 extern volatile int sigterm_cnt;
 
 extern char *start_command;
+extern struct tgl_state *TLS;
+extern int ipv6_enabled;
 
-static void stdin_read_callback_all (int arg, short what, struct event *self) {
-  if (!readline_disabled) {
-    if (((long)arg) & 1) {
-      rl_callback_read_char ();
-    } else {
-      char *line = 0;        
-      size_t len = 0;
-      assert (getline (&line, &len, stdin) >= 0);
-      got_it (line, strlen (line));
-    }
+struct event *term_ev = 0;
+int read_one_string;
+#define MAX_ONE_STRING_LEN 511
+char one_string[MAX_ONE_STRING_LEN + 1];
+int one_string_len;
+void (*one_string_cb)(struct tgl_state *TLS, const char *string[], void *arg);
+enum tgl_value_type one_string_type;
+int one_string_num;
+int one_string_total_args;
+char *one_string_results[10];
+
+void *string_cb_arg;
+char *one_string_prompt;
+int one_string_flags;
+extern int disable_link_preview;
+
+void deactivate_readline (void);
+void reactivate_readline (void);
+
+void do_get_string (struct tgl_state *TLS);
+static void one_string_read_end (void) {
+  printf ("\n");
+  fflush (stdout);
+
+  read_one_string = 0;
+  tfree_str (one_string_prompt);
+  one_string_prompt = NULL;
+  reactivate_readline ();
+
+  one_string_results[one_string_num] = tstrdup (one_string);
+  ++one_string_num;
+
+  if (one_string_num < one_string_total_args) {
+    do_get_string (TLS);
   } else {
-    while (1) {
-      if (line_buffer_pos == line_buffer_size) {
-        line_buffer = realloc (line_buffer, line_buffer_size * 2 + 100);
-        assert (line_buffer);
-        line_buffer_size = line_buffer_size * 2 + 100;
-        assert (line_buffer);
-      }
-      int r = read (0, line_buffer + line_buffer_pos, line_buffer_size - line_buffer_pos);
-      //logprintf ("r = %d, size = %d, pos = %d, what = 0x%x, fd = %d\n", r, line_buffer_size, line_buffer_pos, (int)what, fd);
-      if (r < 0) {
-        perror ("read");
-        delete_stdin_event = 1;
-        break;
-      }
-      if (r == 0) {
-        //struct event *ev = event_base_get_running_event (tgl_state.ev_base);
-        //event_del (ev);
-        //event_del (self);
-        
-        delete_stdin_event = 1;
-        break;
-      }
-      line_buffer_pos += r;
+    one_string_cb (TLS, (void *)one_string_results, string_cb_arg);
+    int i;
+    for (i = 0; i < one_string_total_args; i++) {
+      tfree_str (one_string_results[i]);
+    }
+  }
+}
 
-      while (1) {
-        int p = 0;
-        while (p < line_buffer_pos && line_buffer[p] != '\n') { p ++; }
-        if (p < line_buffer_pos) {
-          if (((long)arg) & 1) {
-            line_buffer[p] = 0;
-            interpreter (line_buffer);
-          } else {
-            got_it (line_buffer, p + 1);
-          }
-          memmove (line_buffer, line_buffer + p + 1, line_buffer_pos - p - 1);
-          line_buffer_pos -= (p + 1);
-        } else {
-          break;
-        }
+void generate_prompt (enum tgl_value_type type, int num) {
+  switch (type) {
+  case tgl_phone_number:
+    assert (!num);
+    one_string_prompt = tstrdup ("phone number: ");
+    one_string_flags = 0;
+    return;
+  case tgl_code:
+    assert (!num);
+    one_string_prompt = tstrdup ("code ('CALL' for phone code): ");
+    one_string_flags = 0;
+    return;
+  case tgl_register_info:
+    one_string_flags = 0;
+    switch (num) {
+    case 0:
+      one_string_prompt = tstrdup ("register (Y/n): ");
+      return;
+    case 1:
+      one_string_prompt = tstrdup ("first name: ");
+      return;
+    case 2:
+      one_string_prompt = tstrdup ("last name: ");
+      return;
+    default:
+      assert (0);
+    }
+    return;
+  case tgl_new_password:
+    one_string_flags = 1;
+    switch (num) {
+    case 0:
+      one_string_prompt = tstrdup ("new password: ");
+      return;
+    case 1:
+      one_string_prompt = tstrdup ("retype new password: ");
+      return;
+    default:
+      assert (0);
+    }
+    return;
+  case tgl_cur_and_new_password:
+    one_string_flags = 1;
+    switch (num) {
+    case 0:
+      one_string_prompt = tstrdup ("old password: ");
+      return;
+    case 1:
+      one_string_prompt = tstrdup ("new password: ");
+      return;
+    case 2:
+      one_string_prompt = tstrdup ("retype new password: ");
+      return;
+    default:
+      assert (0);
+    }
+    return;
+  case tgl_cur_password:
+    one_string_flags = 1;
+    assert (!num);
+    one_string_prompt = tstrdup ("password: ");
+    return;
+  case tgl_bot_hash:
+    one_string_flags = 0;
+    assert (!num);
+    one_string_prompt = tstrdup ("hash: ");
+    return;
+  default:
+    assert (0);
+  }
+}
+
+void do_get_string (struct tgl_state *TLS) {
+  deactivate_readline ();
+  generate_prompt (one_string_type, one_string_num);  
+  printf ("%s", one_string_prompt);
+  fflush (stdout);
+  read_one_string = 1;
+  one_string_len = 0;  
+}
+
+void do_get_values (struct tgl_state *TLS, enum tgl_value_type type, const char *prompt, int num_values,
+          void (*callback)(struct tgl_state *TLS, const char *string[], void *arg), void *arg) {
+  if (type == tgl_bot_hash && bot_hash) {
+    assert (num_values == 1);
+    one_string_results[0] = bot_hash;
+    callback (TLS, (void *)one_string_results, arg);
+    return;
+  }
+  one_string_cb = callback;
+  one_string_num = 0;
+  one_string_total_args = num_values;
+  one_string_type = type;
+  string_cb_arg = arg;
+  do_get_string (TLS); 
+}
+
+static void stdin_read_callback (evutil_socket_t fd, short what, void *arg) {
+  if (!readline_disabled && !read_one_string) {
+    rl_callback_read_char ();
+    return;
+  }
+  if (read_one_string) {
+    char c;
+    int r = read (0, &c, 1);
+    if (r <= 0) {
+      perror ("read");
+      delete_stdin_event = 1;
+      return;
+    }
+    if (c == '\n' || c == '\r') {
+      one_string[one_string_len] = 0;
+      one_string_read_end ();
+      return;
+    }
+    if (one_string_len < MAX_ONE_STRING_LEN) {
+      one_string[one_string_len ++] = c;
+      if (!(one_string_flags & 1)) {
+        printf ("%c", c);
+        fflush (stdout);
       }
+    }
+    return;
+  }
+
+  if (line_buffer_pos == line_buffer_size) {
+    line_buffer = realloc (line_buffer, line_buffer_size * 2 + 100);
+    assert (line_buffer);
+    line_buffer_size = line_buffer_size * 2 + 100;
+    assert (line_buffer);
+  }
+  int r = read (0, line_buffer + line_buffer_pos, line_buffer_size - line_buffer_pos);
+  if (r <= 0) {
+    perror ("read");
+    delete_stdin_event = 1;
+    return;
+  }
+  line_buffer_pos += r;
+
+  while (1) {
+    int p = 0;
+    while (p < line_buffer_pos && line_buffer[p] != '\n') { p ++; }
+    if (p < line_buffer_pos) {
+      line_buffer[p] = 0;
+      interpreter (line_buffer);
+      memmove (line_buffer, line_buffer + p + 1, line_buffer_pos - p - 1);
+      line_buffer_pos -= (p + 1);
+    } else {
       break;
     }
   }
 }
 
-static void stdin_read_callback_char (evutil_socket_t fd, short what, void *arg) {
-  stdin_read_callback_all (1, what, arg);
-}
 
-static void stdin_read_callback_line (evutil_socket_t fd, short what, void *arg) {
-  stdin_read_callback_all (2, what, arg);
-}
-
-struct event *term_ev = 0;
-void net_loop (int flags, int (*is_end)(void)) {
+void net_loop (void) {
   delete_stdin_event = 0;
   if (verbosity >= E_DEBUG) {
     logprintf ("Starting netloop\n");
   }
-  if (flags & 3) {
-    if (flags & 1) {
-      term_ev = event_new (tgl_state.ev_base, 0, EV_READ | EV_PERSIST, stdin_read_callback_char, 0);
-    } else {
-      term_ev = event_new (tgl_state.ev_base, 0, EV_READ | EV_PERSIST, stdin_read_callback_line, 0);
-    }
-    event_add (term_ev, 0);
-  }
+  term_ev = event_new (TLS->ev_base, 0, EV_READ | EV_PERSIST, stdin_read_callback, 0);
+  event_add (term_ev, 0);
+  
   int last_get_state = time (0);
-  while (!is_end || !is_end ()) {
-
-    event_base_loop (tgl_state.ev_base, EVLOOP_ONCE);
+  while (1) {
+    event_base_loop (TLS->ev_base, EVLOOP_ONCE);
 
     if (term_ev && delete_stdin_event) {
+      logprintf ("delete stdin\n");
       event_free (term_ev);
       term_ev = 0;
     }
@@ -184,26 +329,34 @@ void net_loop (int flags, int (*is_end)(void)) {
     #ifdef USE_LUA
       lua_do_all ();
     #endif
-    if (safe_quit && !tgl_state.active_queries) {
+    
+    #ifdef USE_PYTHON
+      py_do_all ();
+    #endif
+
+    if (safe_quit && !TLS->active_queries) {
       printf ("All done. Exit\n");
       do_halt (0);
+      safe_quit = 0;
     }
     if (sigterm_cnt > 0) {
       do_halt (0);
     }
     if (time (0) - last_get_state > 3600) {
-      tgl_do_lookup_state ();
+      tgl_do_lookup_state (TLS);
       last_get_state = time (0);
     }
+    
     write_state_file ();
     update_prompt ();
-    if (unknown_user_list_pos) {
+    
+/*    if (unknown_user_list_pos) {
       int i;
       for (i = 0; i < unknown_user_list_pos; i++) {
-        tgl_do_get_user_info (TGL_MK_USER (unknown_user_list[i]), 0, 0, 0);
+        tgl_do_get_user_info (TLS, TGL_MK_USER (unknown_user_list[i]), 0, 0, 0);
       }
       unknown_user_list_pos = 0;
-    }   
+    }   */
   }
 
   if (term_ev) {
@@ -216,118 +369,19 @@ void net_loop (int flags, int (*is_end)(void)) {
   }
 }
 
-char **_s;
-size_t *_l;
-int got_it_ok;
-
-void got_it (char *line, int len) {
-  assert (len > 0);
-  line[-- len] = 0; // delete end of line
-  *_s = line;
-  *_l = len;  
-  got_it_ok = 1;
-}
-
-int is_got_it (void) {
-  return got_it_ok;
-}
-
-int net_getline (char **s, size_t *l) {
-  fflush (stdout);
-//  rl_already_prompted = 1;
-  got_it_ok = 0;
-  _s = s;
-  _l = l;
-//  rl_callback_handler_install (0, got_it);
-  net_loop (2, is_got_it);
-  return 0;
-}
-
-int main_loop (void) {
-  net_loop (1, 0);
-  return 0;
-}
-
 struct tgl_dc *cur_a_dc;
 int is_authorized (void) {
-  return tgl_authorized_dc (cur_a_dc);
+  return tgl_authorized_dc (TLS, cur_a_dc);
 }
 
 int all_authorized (void) {
   int i;
-  for (i = 0; i <= tgl_state.max_dc_num; i++) if (tgl_state.DC_list[i]) {
-    if (!tgl_authorized_dc (tgl_state.DC_list[i])) {
+  for (i = 0; i <= TLS->max_dc_num; i++) if (TLS->DC_list[i]) {
+    if (!tgl_authorized_dc (TLS, TLS->DC_list[i])) {
       return 0;
     }
   }
   return 1;
-}
-
-int config_got;
-
-int got_config (void) {
-  return config_got;
-}
-
-void on_get_config (void *extra, int success) {
-  if (!success) {
-    logprintf ("Can not get config.\n");
-    do_halt (1);
-  }
-  config_got = 1;
-
-}
-
-int should_register;
-char *hash;
-void sign_in_callback (void *extra, int success, int registered, const char *mhash) {
-  if (!success) {
-    logprintf ("Can not send code\n");
-    do_halt (1);
-  }
-  should_register = !registered;
-  hash = strdup (mhash);
-  assert (hash);
-}
-
-
-int signed_in_ok;
-
-void sign_in_result (void *extra, int success, struct tgl_user *U) {
-  if (!success) {
-    logprintf ("Can not login\n");
-    do_halt (1);
-  }
-  signed_in_ok = 1;
-}
-
-int signed_in (void) {
-  return signed_in_ok;
-}
-
-int sent_code (void) {
-  return hash != 0;
-}
-
-int dc_signed_in (void) {
-  return tgl_signed_dc (cur_a_dc);
-}
-
-void export_auth_callback (void *DC, int success) {
-  if (!success) {
-    logprintf ("Can not export auth\n");
-    do_halt (1);
-  }
-}
-
-int d_got_ok;
-void get_difference_callback (void *extra, int success) {
-  assert (success);
-  d_got_ok = 1;
-}
-
-int dgot (void) {
-  return d_got_ok;
 }
 
 int zero[512];
@@ -368,10 +422,10 @@ void read_state_file (void) {
   int seq = x[2];
   int date = x[3];
   close (state_file_fd); 
-  bl_do_set_seq (seq);
-  bl_do_set_pts (pts);
-  bl_do_set_qts (qts);
-  bl_do_set_date (date);
+  bl_do_set_seq (TLS, seq);
+  bl_do_set_pts (TLS, pts);
+  bl_do_set_qts (TLS, qts);
+  bl_do_set_date (TLS, date);
 }
 
 
@@ -381,8 +435,8 @@ void write_state_file (void) {
   static int wpts;
   static int wqts;
   static int wdate;
-  if (wseq >= tgl_state.seq && wpts >= tgl_state.pts && wqts >= tgl_state.qts && wdate >= tgl_state.date) { return; }
-  wseq = tgl_state.seq; wpts = tgl_state.pts; wqts = tgl_state.qts; wdate = tgl_state.date;
+  if (wseq >= TLS->seq && wpts >= TLS->pts && wqts >= TLS->qts && wdate >= TLS->date) { return; }
+  wseq = TLS->seq; wpts = TLS->pts; wqts = TLS->qts; wdate = TLS->date;
   int state_file_fd = open (get_state_filename (), O_CREAT | O_RDWR, 0600);
   if (state_file_fd < 0) {
     logprintf ("Can not write state file '%s': %m\n", get_state_filename ());
@@ -410,12 +464,12 @@ void write_dc (struct tgl_dc *DC, void *extra) {
     assert (write (auth_file_fd, &x, 4) == 4);
   }
 
-  assert (DC->has_auth);
+  assert (DC->flags & TGLDCF_LOGGED_IN);
 
-  assert (write (auth_file_fd, &DC->port, 4) == 4);
-  int l = strlen (DC->ip);
+  assert (write (auth_file_fd, &DC->options[0]->port, 4) == 4);
+  int l = strlen (DC->options[0]->ip);
   assert (write (auth_file_fd, &l, 4) == 4);
-  assert (write (auth_file_fd, DC->ip, l) == l);
+  assert (write (auth_file_fd, DC->options[0]->ip, l) == l);
   assert (write (auth_file_fd, &DC->auth_key_id, 8) == 8);
   assert (write (auth_file_fd, DC->auth_key, 256) == 256);
 }
@@ -426,17 +480,17 @@ void write_auth_file (void) {
   assert (auth_file_fd >= 0);
   int x = DC_SERIALIZED_MAGIC;
   assert (write (auth_file_fd, &x, 4) == 4);
-  assert (write (auth_file_fd, &tgl_state.max_dc_num, 4) == 4);
-  assert (write (auth_file_fd, &tgl_state.dc_working_num, 4) == 4);
+  assert (write (auth_file_fd, &TLS->max_dc_num, 4) == 4);
+  assert (write (auth_file_fd, &TLS->dc_working_num, 4) == 4);
 
-  tgl_dc_iterator_ex (write_dc, &auth_file_fd);
+  tgl_dc_iterator_ex (TLS, write_dc, &auth_file_fd);
 
-  assert (write (auth_file_fd, &tgl_state.our_id, 4) == 4);
+  assert (write (auth_file_fd, &TLS->our_id.peer_id, 4) == 4);
   close (auth_file_fd);
 }
 
-void write_secret_chat (tgl_peer_t *_P, void *extra) {
-  struct tgl_secret_chat *P = (void *)_P;
+void write_secret_chat (tgl_peer_t *Peer, void *extra) {
+  struct tgl_secret_chat *P = (void *)Peer;
   if (tgl_get_peer_type (P->id) != TGL_PEER_ENCR_CHAT) { return; }
   if (P->state != sc_ok) { return; }
   int *a = extra;
@@ -458,6 +512,10 @@ void write_secret_chat (tgl_peer_t *_P, void *extra) {
   assert (write (fd, &P->state, 4) == 4);
   assert (write (fd, &P->key_fingerprint, 8) == 8);
   assert (write (fd, &P->key, 256) == 256);
+  assert (write (fd, &P->first_key_sha, 20) == 20);
+  assert (write (fd, &P->in_seq_no, 4) == 4);
+  assert (write (fd, &P->last_in_seq_no, 4) == 4);
+  assert (write (fd, &P->out_seq_no, 4) == 4);
 }
 
 void write_secret_chat_file (void) {
@@ -466,7 +524,7 @@ void write_secret_chat_file (void) {
   assert (secret_chat_fd >= 0);
   int x = SECRET_CHAT_FILE_MAGIC;
   assert (write (secret_chat_fd, &x, 4) == 4);
-  x = 0; 
+  x = 2; 
   assert (write (secret_chat_fd, &x, 4) == 4); // version
   assert (write (secret_chat_fd, &x, 4) == 4); // num
 
@@ -474,7 +532,7 @@ void write_secret_chat_file (void) {
   y[0] = secret_chat_fd;
   y[1] = 0;
 
-  tgl_peer_iterator_ex (write_secret_chat, y);
+  tgl_peer_iterator_ex (TLS, write_secret_chat, y);
 
   lseek (secret_chat_fd, 8, SEEK_SET);
   assert (write (secret_chat_fd, &y[1], 4) == 4);
@@ -497,24 +555,24 @@ void read_dc (int auth_file_fd, int id, unsigned ver) {
   assert (read (auth_file_fd, auth_key, 256) == 256);
 
   //bl_do_add_dc (id, ip, l, port, auth_key_id, auth_key);
-  bl_do_dc_option (id, 2, "DC", l, ip, port);
-  bl_do_set_auth_key_id (id, auth_key);
-  bl_do_dc_signed (id);
+  bl_do_dc_option (TLS, 0, id, "DC", 2, ip, l, port);
+  bl_do_set_auth_key (TLS, id, auth_key);
+  bl_do_dc_signed (TLS, id);
 }
 
 void empty_auth_file (void) {
-  if (tgl_state.test_mode) {
-    bl_do_dc_option (1, 0, "", strlen (TG_SERVER_TEST_1), TG_SERVER_TEST_1, 443);
-    bl_do_dc_option (2, 0, "", strlen (TG_SERVER_TEST_2), TG_SERVER_TEST_2, 443);
-    bl_do_dc_option (3, 0, "", strlen (TG_SERVER_TEST_3), TG_SERVER_TEST_3, 443);
-    bl_do_set_working_dc (2);
+  if (TLS->test_mode) {
+    bl_do_dc_option (TLS, 0, 1, "", 0, TG_SERVER_TEST_1, strlen (TG_SERVER_TEST_1), 443);
+    bl_do_dc_option (TLS, 0, 2, "", 0, TG_SERVER_TEST_2, strlen (TG_SERVER_TEST_2), 443);
+    bl_do_dc_option (TLS, 0, 3, "", 0, TG_SERVER_TEST_3, strlen (TG_SERVER_TEST_3), 443);
+    bl_do_set_working_dc (TLS, TG_SERVER_TEST_DEFAULT);
   } else {
-    bl_do_dc_option (1, 0, "", strlen (TG_SERVER_1), TG_SERVER_1, 443);
-    bl_do_dc_option (2, 0, "", strlen (TG_SERVER_2), TG_SERVER_2, 443);
-    bl_do_dc_option (3, 0, "", strlen (TG_SERVER_3), TG_SERVER_3, 443);
-    bl_do_dc_option (4, 0, "", strlen (TG_SERVER_4), TG_SERVER_4, 443);
-    bl_do_dc_option (5, 0, "", strlen (TG_SERVER_5), TG_SERVER_5, 443);
-    bl_do_set_working_dc (2);
+    bl_do_dc_option (TLS, 0, 1, "", 0, TG_SERVER_1, strlen (TG_SERVER_1), 443);
+    bl_do_dc_option (TLS, 0, 2, "", 0, TG_SERVER_2, strlen (TG_SERVER_2), 443);
+    bl_do_dc_option (TLS, 0, 3, "", 0, TG_SERVER_3, strlen (TG_SERVER_3), 443);
+    bl_do_dc_option (TLS, 0, 4, "", 0, TG_SERVER_4, strlen (TG_SERVER_4), 443);
+    bl_do_dc_option (TLS, 0, 5, "", 0, TG_SERVER_5, strlen (TG_SERVER_5), 443);
+    bl_do_set_working_dc (TLS, TG_SERVER_DEFAULT);
   }
 }
 
@@ -547,23 +605,24 @@ void read_auth_file (void) {
       read_dc (auth_file_fd, i, m);
     }
   }
-  bl_do_set_working_dc (dc_working_num);
+  bl_do_set_working_dc (TLS, dc_working_num);
   int our_id;
   int l = read (auth_file_fd, &our_id, 4);
   if (l < 4) {
     assert (!l);
   }
   if (our_id) {
-    bl_do_set_our_id (our_id);
+    bl_do_set_our_id (TLS, TGL_MK_USER (our_id));
   }
   close (auth_file_fd);
 }
 
-void read_secret_chat (int fd) {
+void read_secret_chat (int fd, int v) {
   int id, l, user_id, admin_id, date, ttl, layer, state;
   long long access_hash, key_fingerprint;
   static char s[1000];
   static unsigned char key[256];
+  static unsigned char sha[20];
   assert (read (fd, &id, 4) == 4);
   //assert (read (fd, &flags, 4) == 4);
   assert (read (fd, &l, 4) == 4);
@@ -578,16 +637,33 @@ void read_secret_chat (int fd) {
   assert (read (fd, &state, 4) == 4);
   assert (read (fd, &key_fingerprint, 8) == 8);
   assert (read (fd, &key, 256) == 256);
+  assert (read (fd, sha, 20) == 20);
+  int in_seq_no = 0, out_seq_no = 0, last_in_seq_no = 0;
+  if (v >= 1) {
+    assert (read (fd, &in_seq_no, 4) == 4);
+    assert (read (fd, &last_in_seq_no, 4) == 4);
+    assert (read (fd, &out_seq_no, 4) == 4);
+  }
 
-  bl_do_encr_chat_create (id, user_id, admin_id, s, l);
-  struct tgl_secret_chat  *P = (void *)tgl_peer_get (TGL_MK_ENCR_CHAT (id));
-  assert (P && (P->flags & FLAG_CREATED));
-  bl_do_encr_chat_set_date (P, date);
-  bl_do_encr_chat_set_ttl (P, ttl);
-  bl_do_encr_chat_set_layer (P, layer);
-  bl_do_encr_chat_set_access_hash (P, access_hash);
-  bl_do_encr_chat_set_state (P, state);
-  bl_do_encr_chat_set_key (P, key, key_fingerprint);
+  bl_do_encr_chat (TLS, id, 
+    &access_hash,
+    &date,
+    &admin_id,
+    &user_id,
+    key,
+    NULL,
+    sha,
+    &state,
+    &ttl,
+    &layer,
+    &in_seq_no,
+    &last_in_seq_no,
+    &out_seq_no,
+    &key_fingerprint,
+    TGLECF_CREATE | TGLECF_CREATED,
+    NULL, 0
+  );
+    
 }
 
 void read_secret_chat_file (void) {
@@ -598,18 +674,15 @@ void read_secret_chat_file (void) {
   int x;
   if (read (secret_chat_fd, &x, 4) < 4) { close (secret_chat_fd); return; }
   if (x != SECRET_CHAT_FILE_MAGIC) { close (secret_chat_fd); return; }
-  assert (read (secret_chat_fd, &x, 4) == 4);
-  assert (!x); // version
+  int v = 0;
+  assert (read (secret_chat_fd, &v, 4) == 4);
+  assert (v == 0 || v == 1 || v == 2); // version  
   assert (read (secret_chat_fd, &x, 4) == 4);
   assert (x >= 0);
   while (x --> 0) {
-    read_secret_chat (secret_chat_fd);
+    read_secret_chat (secret_chat_fd, v);
   }
   close (secret_chat_fd);
-}
-
-void dlist_cb (void *callback_extra, int success, int size, tgl_peer_id_t peers[], int last_msg_id[], int unread_count[])  {
-  d_got_ok = 1;
 }
 
 static void read_incoming (struct bufferevent *bev, void *_arg) {
@@ -648,7 +721,7 @@ static void read_incoming (struct bufferevent *bev, void *_arg) {
   }
 }
 
-static void event_incoming (struct bufferevent *bev, short what, void *_arg) {
+void event_incoming (struct bufferevent *bev, short what, void *_arg) {
   struct in_ev *ev = _arg;
   if (what & (BEV_EVENT_EOF | BEV_EVENT_ERROR)) {
     vlogprintf (E_WARNING, "Closing incoming connection\n");
@@ -662,12 +735,12 @@ static void event_incoming (struct bufferevent *bev, short what, void *_arg) {
 
 static void accept_incoming (evutil_socket_t efd, short what, void *arg) {
   vlogprintf (E_WARNING, "Accepting incoming connection\n");
-  unsigned clilen;
+  socklen_t clilen = 0;
   struct sockaddr_in cli_addr;
   int fd = accept (efd, (struct sockaddr *)&cli_addr, &clilen);
 
   assert (fd >= 0);
-  struct bufferevent *bev = bufferevent_socket_new (tgl_state.ev_base, fd, 0);
+  struct bufferevent *bev = bufferevent_socket_new (TLS->ev_base, fd, 0);
   struct in_ev *e = malloc (sizeof (*e));
   e->bev = bev;
   e->refcnt = 1;
@@ -675,186 +748,44 @@ static void accept_incoming (evutil_socket_t efd, short what, void *arg) {
   e->error = 0;
   e->fd = fd;
   bufferevent_setcb (bev, read_incoming, 0, event_incoming, e);
-  bufferevent_enable(bev, EV_READ|EV_WRITE);
+  bufferevent_enable (bev, EV_READ | EV_WRITE);
 }
 
-int loop (void) {
-  //on_start ();
-  tgl_set_callback (&upd_cb);
-  //tgl_state.temp_key_expire_time = 60;
-  tgl_init ();
- 
-  if (binlog_enabled) {
-    double t = tglt_get_double_time ();
-    if (verbosity >= E_DEBUG) {
-      logprintf ("replay log start\n");
-    }
-    tgl_replay_log ();
-    if (verbosity >= E_DEBUG) {
-      logprintf ("replay log end in %lf seconds\n", tglt_get_double_time () - t);
-    }
-    tgl_reopen_binlog_for_writing ();
-  } else {
-    read_auth_file ();
-    read_state_file ();
-    read_secret_chat_file ();
-  }
-
-  binlog_read = 1;
-  #ifdef USE_LUA
-    lua_binlog_end ();
-  #endif
-  
-  if (sfd >= 0) {
-    struct event *ev = event_new (tgl_state.ev_base, sfd, EV_READ | EV_PERSIST, accept_incoming, 0);
-    event_add (ev, 0);
-  }
-  if (usfd >= 0) {
-    struct event *ev = event_new (tgl_state.ev_base, usfd, EV_READ | EV_PERSIST, accept_incoming, 0);
-    event_add (ev, 0);
-  }
-  update_prompt ();
-   
-  if (reset_authorization) {
-    tgl_peer_t *P = tgl_peer_get (TGL_MK_USER (tgl_state.our_id));
-    if (P && P->user.phone && reset_authorization == 1) {
-      set_default_username (P->user.phone);
-    }
-    bl_do_reset_authorization ();
-  }
-
-  net_loop (0, all_authorized);
-
-  int i;
-  for (i = 0; i <= tgl_state.max_dc_num; i++) if (tgl_state.DC_list[i] && !tgl_authorized_dc (tgl_state.DC_list[i])) {
-    assert (0);
-  }
-
-  if (!tgl_signed_dc (tgl_state.DC_working)) {
-    if (disable_output) {
-      fprintf (stderr, "Can not login without output\n");
-      do_halt (1);
-    }
-    if (!default_username) {
-      size_t size = 0;
-      char *user = 0;
-
-      if (!user) {
-        printf ("Telephone number (with '+' sign): ");         
-        if (net_getline (&user, &size) == -1) {
-          perror ("getline()");
-          do_halt (1);
-        }
-        set_default_username (user);
-      }
-    }
-    tgl_do_send_code (default_username, sign_in_callback, 0);
-    net_loop (0, sent_code);
-   
-    if (verbosity >= E_DEBUG) {
-      logprintf ("%s\n", should_register ? "phone not registered" : "phone registered");
-    }
-    if (!should_register) {
-      char *code = 0;
-      size_t size = 0;
-      printf ("Code from sms (if you did not receive an SMS and want to be called, type \"call\"): ");
-      while (1) {
-        if (net_getline (&code, &size) == -1) {
-          perror ("getline()");
-          do_halt (1);
-        }
-        if (!strcmp (code, "call")) {
-          printf ("You typed \"call\", switching to phone system.\n");
-          tgl_do_phone_call (default_username, hash, 0, 0);
-          printf ("Calling you! Code: ");
-          continue;
-        }
-        if (tgl_do_send_code_result (default_username, hash, code, sign_in_result, 0) >= 0) {
-          break;
-        }
-        printf ("Invalid code. Try again: ");
-        free (code);
-      }
-    } else {
-      printf ("User is not registered. Do you want to register? [Y/n] ");
-      char *code;
-      size_t size;
-      if (net_getline (&code, &size) == -1) {
-        perror ("getline()");
-        do_halt (1);
-      }
-      if (!*code || *code == 'y' || *code == 'Y') {
-        printf ("Ok, starting registartion.\n");
-      } else {
-        printf ("Then try again\n");
-        do_halt (1);
-      }
-      char *first_name;
-      printf ("First name: ");
-      if (net_getline (&first_name, &size) == -1) {
-        perror ("getline()");
-        do_halt (1);
-      }
-      char *last_name;
-      printf ("Last name: ");
-      if (net_getline (&last_name, &size) == -1) {
-        perror ("getline()");
-        do_halt (1);
-      }
-      printf ("Code from sms (if you did not receive an SMS and want to be called, type \"call\"): ");
-      while (1) {
-        if (net_getline (&code, &size) == -1) {
-          perror ("getline()");
-          do_halt (1);
-        }
-        if (!strcmp (code, "call")) {
-          printf ("You typed \"call\", switching to phone system.\n");
-          tgl_do_phone_call (default_username, hash, 0, 0);
-          printf ("Calling you! Code: ");
-          continue;
-        }
-        if (tgl_do_send_code_result_auth (default_username, hash, code, first_name, last_name, sign_in_result, 0) >= 0) {
-          break;
-        }
-        printf ("Invalid code. Try again: ");
-        free (code);
-      }
-    }
-
-    net_loop (0, signed_in);    
-    //bl_do_dc_signed (tgl_state.DC_working);
-  }
-
-  for (i = 0; i <= tgl_state.max_dc_num; i++) if (tgl_state.DC_list[i] && !tgl_signed_dc (tgl_state.DC_list[i])) {
-    tgl_do_export_auth (i, export_auth_callback, (void*)(long)tgl_state.DC_list[i]);    
-    cur_a_dc = tgl_state.DC_list[i];
-    net_loop (0, dc_signed_in);
-    assert (tgl_signed_dc (tgl_state.DC_list[i]));
-  }
+char *get_downloads_directory (void);
+void on_login (struct tgl_state *TLS) {
   write_auth_file ();
-  
-  fflush (stdout);
-  fflush (stderr);
+}
 
-  //read_state_file ();
-  //read_secret_chat_file ();
+void on_failed_login (struct tgl_state *TLS) {
+  logprintf ("login failed\n");
+  logprintf ("login error #%d: %s\n", TLS->error_code, TLS->error);
+  logprintf ("you can relogin by deleting auth file or running telegram-cli with '-q' flag\n");
+  exit (2);
+}
 
-  set_interface_callbacks ();
+void on_started (struct tgl_state *TLS);
+void clist_cb (struct tgl_state *TLSR, void *callback_extra, int success, int size, tgl_peer_id_t peers[], tgl_message_id_t *last_msg_id[], int unread_count[]) {
+  on_started (TLS);
+}
 
-  tglm_send_all_unsent ();
-  tgl_do_get_difference (sync_from_start, get_difference_callback, 0);
-  net_loop (0, dgot);
-  assert (!(tgl_state.locks & TGL_LOCK_DIFF));
-  tgl_state.started = 1;
+void dlist_cb (struct tgl_state *TLSR, void *callback_extra, int success, int size, tgl_peer_id_t peers[], tgl_message_id_t *last_msg_id[], int unread_count[])  {
+  tgl_do_get_channels_dialog_list (TLS, 100, 0, clist_cb, 0);
+}
+
+void on_started (struct tgl_state *TLS) {
   if (wait_dialog_list) {
-    d_got_ok = 0;
-    tgl_do_get_dialog_list (dlist_cb, 0);
-    net_loop (0, dgot);
+    wait_dialog_list = 0;
+    tgl_do_get_dialog_list (TLS, 100, 0, dlist_cb, 0);
+    return;
   }
   #ifdef USE_LUA
     lua_diff_end ();
   #endif
 
+  #ifdef USE_PYTHON
+    py_diff_end ();
+  #endif
+  
   if (start_command) {
     safe_quit = 1;
     while (*start_command) {
@@ -869,13 +800,75 @@ int loop (void) {
       interpreter_ex (start, 0);
     }
   }
+}
 
-  /*tgl_do_get_dialog_list (get_dialogs_callback, 0);
-  if (wait_dialog_list) {
-    dialog_list_got = 0;
-    net_loop (0, dlgot);
-  }*/
+int loop (void) {
+  tgl_set_callback (TLS, &upd_cb);
+  struct event_base *ev = event_base_new ();
+  tgl_set_ev_base (TLS, ev);
+  tgl_set_net_methods (TLS, &tgl_conn_methods);
+  tgl_set_timer_methods (TLS, &tgl_libevent_timers);
+  assert (TLS->timer_methods);
+  tgl_set_download_directory (TLS, get_downloads_directory ());
+  tgl_register_app_id (TLS, TELEGRAM_CLI_APP_ID, TELEGRAM_CLI_APP_HASH); 
+  tgl_set_app_version (TLS, "Telegram-cli " TELEGRAM_CLI_VERSION);
+  if (ipv6_enabled) {
+    tgl_enable_ipv6 (TLS);
+  }
+  if (bot_mode) {
+    tgl_enable_bot (TLS);
+  }
+  if (disable_link_preview) {
+    tgl_disable_link_preview (TLS);
+  }
+  assert (tgl_init (TLS) >= 0);
+ 
+  /*if (binlog_enabled) {
+    double t = tglt_get_double_time ();
+    if (verbosity >= E_DEBUG) {
+      logprintf ("replay log start\n");
+    }
+    tgl_replay_log (TLS);
+    if (verbosity >= E_DEBUG) {
+      logprintf ("replay log end in %lf seconds\n", tglt_get_double_time () - t);
+    }
+    tgl_reopen_binlog_for_writing (TLS);
+  } else {*/
+    read_auth_file ();
+    read_state_file ();
+    read_secret_chat_file ();
+  //}
 
-  return main_loop ();
+  binlog_read = 1;
+  #ifdef USE_LUA
+    lua_binlog_end ();
+  #endif
+  
+  #ifdef USE_PYTHON
+    py_binlog_end ();
+  #endif
+  
+  if (sfd >= 0) {
+    struct event *ev = event_new (TLS->ev_base, sfd, EV_READ | EV_PERSIST, accept_incoming, 0);
+    event_add (ev, 0);
+  }
+  if (usfd >= 0) {
+    struct event *ev = event_new (TLS->ev_base, usfd, EV_READ | EV_PERSIST, accept_incoming, 0);
+    event_add (ev, 0);
+  }
+  update_prompt ();
+   
+  if (reset_authorization) {
+    tgl_peer_t *P = tgl_peer_get (TLS, TLS->our_id);
+    if (P && P->user.phone && reset_authorization == 1) {
+      set_default_username (P->user.phone);
+    }
+    bl_do_reset_authorization (TLS);
+  }
+
+  set_interface_callbacks ();
+  tgl_login (TLS);
+  net_loop ();
+  return 0;
 }
 
